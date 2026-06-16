@@ -1,0 +1,10 @@
+{
+  "y_min_px": 100,
+  "y_max_px": 500,
+  "h_min_cm": 0.0,
+  "h_max_cm": 180.0,
+  "camera_id": "CAM-01",
+  "location": "River Gate A",
+  "notes": "Default calibration \u2014 please recalibrate for your site.",
+  "saved_at": "2026-05-25T12:49:22.811324"
+}

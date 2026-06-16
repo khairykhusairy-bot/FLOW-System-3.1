@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background:#0a0e1a;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    overflow-x: hidden;
+  }
+
+  #cam-status {
+    font-size: 11px;
+    padding: 4px 0 4px;
+    color: #7ba3cc;
+  }
+
+  #infobar {
+    display: flex; align-items: center; gap: 18px;
+    padding: 6px 12px; background: #111827;
+    border: 1px solid #1e3a5f; border-radius: 6px;
+    margin-bottom: 6px; font-size: 11px; color: #7ba3cc; flex-wrap: wrap;
+  }
+  #infobar span { display:flex; align-items:center; gap:5px; }
+  #infobar b { color:#00d4ff; }
+  #pt-count { margin-left:auto; color:#00e676; font-weight:700; font-size:12px; }
+
+  #wrap { position:relative; display:block; width:100%; }
+  #liveVideo { display:none; }
+  #bgCanvas {
+    display:block; width:100%; height:auto;
+    cursor:crosshair; border:1px solid #1e3a5f; border-radius:8px;
+  }
+
+  /* Coordinates read-only display */
+  #coords-section { margin-top:8px; }
+  #coords-label {
+    font-size:10px; color:#4a6b8a; margin-bottom:3px;
+    letter-spacing:1px; text-transform:uppercase;
+  }
+  #coords-display {
+    width:100%; background:#111827; border:1px solid #1e3a5f; border-radius:6px;
+    color:#00d4ff; font-family:inherit; font-size:11px;
+    padding:7px 10px; resize:none; outline:none;
+  }
+
+  /* Action buttons */
+  #btn-row { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+  .action-btn {
+    flex:1; min-width:120px; padding:9px 14px;
+    border:none; border-radius:6px; font-size:12px;
+    font-weight:700; cursor:pointer; letter-spacing:0.5px;
+    transition:background 0.15s, opacity 0.15s;
+  }
+  #apply-btn  { background:#00b4d8; color:#fff; }
+  #apply-btn:hover:not(:disabled) { background:#0096c7; }
+  #save-btn   { background:#1a6b3a; color:#fff; }
+  #save-btn:hover:not(:disabled) { background:#27ae60; }
+  #cancel-btn { background:#1e2a3a; color:#aaa; flex:0 0 auto; min-width:90px; }
+  #cancel-btn:hover { background:#2c3e50; color:#ddd; }
+  .action-btn:disabled { background:#1e3a5f !important; color:#4a6b8a !important; cursor:not-allowed; opacity:0.6; }
+
+  #status-msg {
+    font-size:11px; margin-top:6px; padding:4px 8px;
+    border-radius:4px; display:none;
+  }
+  #status-msg.success { color:#00e676; background:rgba(0,230,118,0.08); border:1px solid rgba(0,230,118,0.2); }
+  #status-msg.error   { color:#f44336; background:rgba(244,67,54,0.08);  border:1px solid rgba(244,67,54,0.2); }
+</style>
+</head>
+<body>
+
+<div id="cam-status">📷 Initialising…</div>
+
+<div id="infobar">
+  <span>🖱 <b>Left-click</b> add point</span>
+  <span>🖱 <b>Right-click</b> undo</span>
+  <span>⌨ <b>R</b> reset</span>
+  <span>⌨ <b>Z</b> undo last</span>
+  <div id="pt-count">0 points (need ≥3)</div>
+</div>
+
+<div id="wrap">
+  <video id="liveVideo" autoplay playsinline muted></video>
+  <canvas id="bgCanvas"></canvas>
+</div>
+
+<div id="coords-section">
+  <div id="coords-label">Current ROI Coordinates (auto-updated)</div>
+  <textarea id="coords-display" rows="2" readonly>[]</textarea>
+</div>
+
+<div id="btn-row">
+  <button id="apply-btn" class="action-btn" disabled>✅ Apply ROI</button>
+  <button id="save-btn"  class="action-btn" disabled>💾 Save to Config</button>
+  <button id="cancel-btn" class="action-btn">✕ Cancel</button>
+</div>
+<div id="status-msg"></div>
+
+<script>
+(function () {
+  // ── State ───────────────────────────────────────────────────────────────────
+  let CANVAS_W   = 960;
+  let CANVAS_H   = 540;
+  let CAM_INDEX  = 0;
+  let drawTarget = "debris";   // "debris" | "gauge"
+  let showSave   = true;
+
+  let points     = [];
+  let hover      = null;
+  let videoReady = false;
+  let cameraStarted = false;
+
+  const video      = document.getElementById("liveVideo");
+  const canvas     = document.getElementById("bgCanvas");
+  const ctx        = canvas.getContext("2d");
+  const ptCount    = document.getElementById("pt-count");
+  const coordsDisp = document.getElementById("coords-display");
+  const applyBtn   = document.getElementById("apply-btn");
+  const saveBtn    = document.getElementById("save-btn");
+  const cancelBtn  = document.getElementById("cancel-btn");
+  const statusMsg  = document.getElementById("status-msg");
+  const camStatus  = document.getElementById("cam-status");
+
+  canvas.width  = CANVAS_W;
+  canvas.height = CANVAS_H;
+
+  // ── Streamlit Component Protocol ────────────────────────────────────────────
+  // Signal readiness → Streamlit responds with streamlit:render containing props.
+  window.parent.postMessage({ type: "streamlit:componentReady", apiVersion: 1 }, "*");
+
+  function sendValue(value) {
+    window.parent.postMessage({ type: "streamlit:setComponentValue", value: value }, "*");
+  }
+
+  function setFrameHeight() {
+    window.parent.postMessage(
+      { type: "streamlit:setFrameHeight", height: document.documentElement.scrollHeight + 8 },
+      "*"
+    );
+  }
+
+  // Listen for render events → update props and re-initialise if needed.
+  window.addEventListener("message", function (event) {
+    if (!event.data || event.data.type !== "streamlit:render") return;
+    const args = event.data.args || {};
+
+    // Canvas dimensions
+    const newW = args.bg_w || 960;
+    const newH = args.bg_h || 540;
+    if (newW !== CANVAS_W || newH !== CANVAS_H) {
+      CANVAS_W = newW;
+      CANVAS_H = newH;
+      canvas.width  = CANVAS_W;
+      canvas.height = CANVAS_H;
+    }
+
+    // Draw target ("debris" or "gauge")
+    drawTarget = args.draw_target || "debris";
+
+    // Camera index
+    if (args.cam_index !== undefined) CAM_INDEX = args.cam_index;
+
+    // Show/hide Save button
+    showSave = args.show_save_btn !== false;
+    saveBtn.style.display = showSave ? "" : "none";
+
+    // Button labels
+    if (drawTarget === "gauge") {
+      applyBtn.textContent = "✅ Apply Gauge ROI";
+      saveBtn.textContent  = "💾 Save Gauge ROI";
+    } else {
+      applyBtn.textContent = "✅ Apply Polygon ROI";
+      saveBtn.textContent  = "💾 Save to Config";
+    }
+
+    // Pre-populate points on first render only (don't overwrite mid-draw)
+    const initPts = args.existing_points || [];
+    if (points.length === 0 && initPts.length > 0) {
+      points = initPts.map(function (p) { return { x: p[0], y: p[1] }; });
+      refreshDisplay();
+    }
+
+    // Start camera once
+    if (!cameraStarted) {
+      cameraStarted = true;
+      startCamera();
+    }
+
+    // Inform Streamlit of our height after first render
+    setTimeout(setFrameHeight, 100);
+  });
+
+  // ── Camera ──────────────────────────────────────────────────────────────────
+  async function startCamera() {
+    try {
+      const initial = await navigator.mediaDevices.getUserMedia({
+        video: { width: CANVAS_W, height: CANVAS_H }
+      });
+
+      let final = initial;
+
+      if (CAM_INDEX > 0) {
+        try {
+          const devs = await navigator.mediaDevices.enumerateDevices();
+          const cams  = devs.filter(function (d) { return d.kind === "videoinput"; });
+          const devId = cams[CAM_INDEX] ? cams[CAM_INDEX].deviceId : null;
+          if (devId) {
+            initial.getTracks().forEach(function (t) { t.stop(); });
+            final = await navigator.mediaDevices.getUserMedia({
+              video: { deviceId: { exact: devId }, width: CANVAS_W, height: CANVAS_H }
+            });
+          }
+        } catch (switchErr) {
+          console.warn("[FLOW] Camera switch failed:", switchErr.message);
+        }
+      }
+
+      video.srcObject = final;
+      window._flowStream = final;
+
+      video.addEventListener("playing", function () {
+        videoReady = true;
+        camStatus.style.color = "#00e676";
+        camStatus.textContent  = "📷 Live — draw your polygon on the frame";
+        setFrameHeight();
+      });
+      await video.play();
+
+    } catch (err) {
+      camStatus.style.color = "#e74c3c";
+      const denied = err.name === "NotAllowedError" || err.name === "PermissionDeniedError";
+      camStatus.textContent = denied
+        ? "⚠ Camera permission denied — allow camera access in your browser, then reload"
+        : "⚠ Camera error: " + err.message;
+    }
+  }
+
+  window.addEventListener("beforeunload", function () {
+    if (window._flowStream) {
+      window._flowStream.getTracks().forEach(function (t) { t.stop(); });
+    }
+  });
+
+  // ── Animation loop ──────────────────────────────────────────────────────────
+  function loop() {
+    ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+
+    if (videoReady && video.readyState >= 2) {
+      ctx.drawImage(video, 0, 0, CANVAS_W, CANVAS_H);
+    } else {
+      ctx.fillStyle = "#0a1628";
+      ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+      ctx.fillStyle = "#4a6b8a";
+      ctx.font = "16px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Waiting for webcam…", CANVAS_W / 2, CANVAS_H / 2);
+      ctx.textAlign = "left";
+    }
+
+    drawPolygon();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // ── Coordinate scaling ──────────────────────────────────────────────────────
+  function getScale() {
+    return CANVAS_W / canvas.getBoundingClientRect().width;
+  }
+
+  function canvasXY(e) {
+    const r = canvas.getBoundingClientRect();
+    const s = getScale();
+    return {
+      x: Math.round((e.clientX - r.left) * s),
+      y: Math.round((e.clientY - r.top)  * s),
+    };
+  }
+
+  // ── Display refresh (no Streamlit rerun triggered during drawing) ────────────
+  function refreshDisplay() {
+    const arr = points.map(function (p) { return [p.x, p.y]; });
+    coordsDisp.value = JSON.stringify(arr);
+
+    const n = points.length;
+    ptCount.textContent = n + " point" + (n !== 1 ? "s" : "")
+      + (n >= 3 ? "  ✓" : "  (need ≥3)");
+
+    const ok = n >= 3;
+    applyBtn.disabled = !ok;
+    saveBtn.disabled  = !ok;
+  }
+
+  // ── Polygon rendering ────────────────────────────────────────────────────────
+  function drawPolygon() {
+    if (points.length === 0) return;
+
+    // Filled polygon (≥3 points)
+    if (points.length >= 3) {
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (var i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
+      ctx.closePath();
+      ctx.fillStyle   = "rgba(0,212,255,0.18)";
+      ctx.fill();
+      ctx.strokeStyle = "#00d4ff";
+      ctx.lineWidth   = 2;
+      ctx.setLineDash([]);
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (var i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
+      ctx.strokeStyle = "#00d4ff";
+      ctx.lineWidth   = 2;
+      ctx.setLineDash([]);
+      ctx.stroke();
+    }
+
+    // Hover preview lines
+    if (hover && points.length >= 1) {
+      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = "rgba(0,212,255,0.5)";
+      ctx.lineWidth   = 1;
+      ctx.beginPath();
+      ctx.moveTo(points[points.length - 1].x, points[points.length - 1].y);
+      ctx.lineTo(hover.x, hover.y);
+      ctx.stroke();
+      if (points.length >= 2) {
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        ctx.lineTo(hover.x, hover.y);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+    }
+
+    // Dots + labels
+    var DOT_COLORS = ["#00e676","#00d4ff","#ff9800","#e040fb",
+                      "#f44336","#ffeb3b","#69f0ae","#40c4ff"];
+    for (var i = 0; i < points.length; i++) {
+      var p   = points[i];
+      var col = DOT_COLORS[i % DOT_COLORS.length];
+
+      ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(0,0,0,0.55)"; ctx.fill();
+
+      ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+      ctx.fillStyle = col; ctx.fill();
+
+      ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, Math.PI * 2);
+      ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.stroke();
+
+      var lbl = "P" + (i + 1);
+      ctx.font = "bold 11px 'SF Mono', monospace";
+      var tw = ctx.measureText(lbl).width;
+      var lx = p.x + 13, ly = p.y - 6;
+      ctx.fillStyle = "rgba(0,0,0,0.7)";
+      ctx.fillRect(lx - 2, ly - 11, tw + 6, 14);
+      ctx.fillStyle = col;
+      ctx.fillText(lbl, lx + 1, ly);
+
+      var coord = "(" + p.x + ", " + p.y + ")";
+      ctx.font = "10px 'SF Mono', monospace";
+      ctx.fillStyle = "rgba(200,220,255,0.85)";
+      ctx.fillText(coord, lx + 1, ly + 12);
+    }
+  }
+
+  // ── Canvas interaction events ────────────────────────────────────────────────
+  canvas.addEventListener("mousemove", function (e) { hover = canvasXY(e); });
+  canvas.addEventListener("mouseleave", function ()  { hover = null; });
+
+  canvas.addEventListener("click", function (e) {
+    e.preventDefault();
+    points.push(canvasXY(e));
+    refreshDisplay();
+    hideStatus();
+  });
+
+  canvas.addEventListener("contextmenu", function (e) {
+    e.preventDefault();
+    if (points.length > 0) { points.pop(); refreshDisplay(); hideStatus(); }
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "r" || e.key === "R") { points = []; refreshDisplay(); hideStatus(); }
+    if (e.key === "z" || e.key === "Z") {
+      if (points.length > 0) { points.pop(); refreshDisplay(); hideStatus(); }
+    }
+  });
+
+  // ── Status helpers ───────────────────────────────────────────────────────────
+  function showStatus(msg, type) {
+    statusMsg.textContent = msg;
+    statusMsg.className   = "status-msg " + type;
+    statusMsg.style.display = "";
+  }
+  function hideStatus() {
+    statusMsg.style.display = "none";
+  }
+
+  // ── Button handlers ──────────────────────────────────────────────────────────
+  applyBtn.addEventListener("click", function () {
+    if (points.length < 3) {
+      showStatus("⚠ Need at least 3 points to define the ROI area.", "error");
+      return;
+    }
+    showStatus("⏳ Applying ROI…", "success");
+    sendValue({ action: "apply", points: points.map(function (p) { return [p.x, p.y]; }) });
+  });
+
+  saveBtn.addEventListener("click", function () {
+    if (points.length < 3) {
+      showStatus("⚠ Need at least 3 points to define the ROI area.", "error");
+      return;
+    }
+    showStatus("⏳ Saving ROI to config…", "success");
+    sendValue({ action: "save", points: points.map(function (p) { return [p.x, p.y]; }) });
+  });
+
+  cancelBtn.addEventListener("click", function () {
+    sendValue({ action: "cancel", points: [] });
+  });
+
+  // Initial display
+  refreshDisplay();
+  setFrameHeight();
+})();
+</script>
+</body>
+</html>
